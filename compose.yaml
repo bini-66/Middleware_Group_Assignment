@@ -24,6 +24,7 @@ services:
       - "127.0.0.1:50051:50051"
     volumes:
       - node1-data:/data
+      - ./logs:/app/logs
 
   node2:
     <<: *node-common
@@ -35,6 +36,7 @@ services:
       - "127.0.0.1:50052:50051"
     volumes:
       - node2-data:/data
+      - ./logs:/app/logs
 
   node3:
     <<: *node-common
@@ -46,6 +48,7 @@ services:
       - "127.0.0.1:50053:50051"
     volumes:
       - node3-data:/data
+      - ./logs:/app/logs
 
 volumes:
   node1-data:

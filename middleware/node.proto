@@ -1,0 +1,96 @@
+syntax = "proto3";
+package chat;
+
+// =====================================================================
+//  SHARED CONTRACT - every node speaks this. Change it only after
+//  agreeing with the whole group, then run:  ./scripts/gen_proto.sh
+// =====================================================================
+
+service Node {
+  // ---- Client-facing (Role 4 serves these, Role 2 decides who is leader)
+  rpc SendMessage (ChatRequest) returns (ChatReply);
+  rpc ReadMessages (ReadRequest) returns (ReadReply);
+
+  // ---- Role 2: Consensus
+  rpc RequestVote (VoteRequest) returns (VoteReply);
+  rpc AppendEntries (AppendRequest) returns (AppendReply);
+
+  // ---- Role 3: Fault tolerance
+  rpc Heartbeat (HeartbeatRequest) returns (HeartbeatReply);
+
+  // ---- Role 4: Replication and catch-up
+  rpc Replicate (ReplicateRequest) returns (ReplicateReply);
+  rpc SyncLog (SyncRequest) returns (SyncReply);
+
+  // ---- Role 1: Time
+  rpc GetTime (TimeRequest) returns (TimeReply);
+
+  // ---- Admin / fault injection (never blocked by injected faults)
+  rpc SetFault (FaultConfig) returns (FaultAck);
+  rpc GetStatus (Empty) returns (NodeStatus);
+}
+
+message Empty {}
+
+// One chat message stored in the replicated log.
+message LogEntry {
+  int64  index      = 1;  // position in the log, starting at 1
+  int64  term       = 2;  // leader term that created it
+  string message_id = 3;  // client-generated, used for duplicate detection
+  string sender     = 4;  // chat user name
+  string text       = 5;
+  int64  lamport    = 6;  // Lamport timestamp (logical order)
+  double wall_time  = 7;  // creator's wall clock (may be skewed!)
+}
+
+// ---------- client-facing ----------
+message ChatRequest { string message_id = 1; string sender = 2; string text = 3; }
+message ChatReply {
+  bool   ok        = 1;
+  string error     = 2;   // "NOT_LEADER", "NO_QUORUM", ...
+  string leader_id = 3;   // hint so the client can redirect
+  int64  index     = 4;
+  int64  lamport   = 5;
+}
+message ReadRequest { int64 from_index = 1; }
+message ReadReply   { repeated LogEntry entries = 1; string served_by = 2; }
+
+// ---------- Role 2: consensus (Raft-shaped) ----------
+message VoteRequest   { int64 term = 1; string candidate_id = 2; int64 last_log_index = 3; int64 last_log_term = 4; }
+message VoteReply     { int64 term = 1; bool vote_granted = 2; }
+message AppendRequest {
+  int64 term = 1; string leader_id = 2;
+  int64 prev_log_index = 3; int64 prev_log_term = 4;
+  repeated LogEntry entries = 5; int64 leader_commit = 6;
+}
+message AppendReply   { int64 term = 1; bool success = 2; int64 match_index = 3; }
+
+// ---------- Role 3: fault tolerance ----------
+message HeartbeatRequest { string sender = 1; }
+message HeartbeatReply   { string node_id = 1; string role = 2; int64 term = 3; }
+
+// ---------- Role 4: replication ----------
+message ReplicateRequest { LogEntry entry = 1; }
+message ReplicateReply   { bool ok = 1; int64 last_index = 2; }
+message SyncRequest      { int64 from_index = 1; }   // "send me everything from here"
+message SyncReply        { repeated LogEntry entries = 1; }
+
+// ---------- Role 1: time ----------
+message TimeRequest {}
+message TimeReply   { double wall_time = 1; }
+
+// ---------- admin ----------
+message FaultConfig {
+  double drop_rate    = 1;           // 0.0 - 1.0 of incoming node-to-node RPCs
+  int32  delay_ms     = 2;           // added to every incoming node-to-node RPC
+  repeated string blocked = 3;       // peers this node cannot talk to (partition)
+  double clock_offset = 4;           // seconds added to this node's clock
+}
+message FaultAck { bool ok = 1; }
+message NodeStatus {
+  string node_id = 1; string role = 2; int64 term = 3; string leader_id = 4;
+  int64 log_length = 5; int64 lamport = 6;
+  repeated string alive_peers = 7;
+  double drop_rate = 8; int32 delay_ms = 9; repeated string blocked = 10;
+  double clock_offset = 11; double wall_time = 12;
+}

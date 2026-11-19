@@ -1,21 +1,171 @@
 # Middleware_Group_Assignment
 
-A distributed group chat system built with Python and gRPC for the SCS2314 Middleware Architecture assignment.
+A fault-tolerant, replicated group-chat system built with Python and **gRPC** for the
+SCS2314 Middleware Architecture assignment.
 
-The project combines four mechanisms:
+Clients talk to a cluster of nodes over gRPC; nodes talk to each other over gRPC too.
+The project combines four mechanisms, one per group member:
 
-- Time and ordering
-- Consensus
-- Fault tolerance
-- Replication and consistency
+| Role | Mechanism | File |
+| --- | --- | --- |
+| 1 | Time and ordering | `mechanisms/logical_clock.py` |
+| 2 | Consensus / leader election | `mechanisms/consensus.py` |
+| 3 | Fault tolerance | `mechanisms/fault_tolerance.py` |
+| 4 | Replication and consistency | `mechanisms/replication.py` |
 
-## Current Docker Setup
+> Members / index numbers / roles / video link: *(fill in before submission)*
 
-The Docker environment starts three development nodes running a standard gRPC health service.
+## Project status
 
-This setup verifies that containers, Python dependencies, networking, and gRPC communication work correctly.
+**Foundation: done.** Shared gRPC contract, threaded node, config, logging, client,
+fault injection, Docker environment, smoke test.
 
-**Chat functionality, leader election, consensus, and replication are not implemented by the development health server.**
+**The four mechanisms are starter versions** - see [What is a placeholder](#what-is-a-placeholder-vs-done).
+In particular **consensus is a placeholder: `node1` is always the leader**, so killing
+`node1` stops writes until Role 2 implements real election.
+
+## Quick start
+
+### Option A - Docker (3 nodes, recommended for demos)
+
+See [Prerequisites](#prerequisites) first, then from the repository root:
+
+```sh
+docker compose up --build -d
+docker compose ps                       # wait until node1-3 are "healthy"
+```
+
+Chat client and tools run on your computer (not in Docker):
+
+```sh
+python -m venv venv
+venv\Scripts\activate                   # Windows   (macOS/Linux: source venv/bin/activate)
+pip install -r requirements.txt
+
+python -m client.chat_client --name alice
+python -m tools.fault status
+```
+
+### Option B - local processes (no Docker, fastest while developing)
+
+```sh
+python -m tools.cluster up              # starts 3 nodes on 127.0.0.1:50051-50053
+python -m client.chat_client --name alice
+python -m tools.fault status
+python -m tools.cluster down
+```
+
+Works on Windows, macOS and Linux. **Use either A or B, not both at once** - they use
+the same host ports (50051-50053).
+
+### Smoke test
+
+```sh
+python -m unittest tests.test_foundation -v
+```
+
+Boots a real 3-node cluster and checks redirect, replication, crash, catch-up,
+partition and heal. Stop any running cluster first (same ports).
+
+## Chat client
+
+```sh
+python -m client.chat_client --name alice                  # interactive: /read [node], /quit
+python -m client.chat_client --name bob --auto 20          # send 20 messages automatically
+python -m client.chat_client --name bob --read node2       # print the log held by node2
+```
+
+Run several at once (different `--name`) to test concurrent clients. Every request,
+response and error is printed and saved with a timestamp to `logs/client_<name>.log`.
+The client follows leader redirects, retries on failure, and reuses the same
+`message_id` on retries so a retry never creates a duplicate message.
+
+## Fault injection (assignment demo faults)
+
+| Demo fault | Local processes | Docker |
+| --- | --- | --- |
+| Crash a node (hard) | `python -m tools.cluster kill node1` | `docker compose kill node1` |
+| Stop gracefully | - | `docker compose stop node1` |
+| Restart (watch catch-up) | `python -m tools.cluster start node1` | `docker compose start node1` |
+| Partition | `python -m tools.fault partition node1,node2 node3` | same |
+| Heal | `python -m tools.fault heal` | same |
+| Skew a clock | `python -m tools.fault skew node2 5` | same |
+| Delay messages | `python -m tools.fault delay node2 500` | same |
+| Drop messages | `python -m tools.fault drop node2 0.3` | same |
+| Conflicting concurrent clients | run two `chat_client` processes at once | same |
+
+`python -m tools.fault status` shows every node's role, term, leader, log length,
+Lamport time, which peers it believes are alive, and active faults.
+Injected faults only affect **node-to-node** traffic; client, admin and Docker
+health-check calls are never faulted, so you can always heal.
+
+Logs: `logs/<node>.log` (node state - also shared out of the containers) and
+`logs/client_<name>.log`. Docker: `docker compose logs -f node1`.
+
+## Architecture
+
+```
+ clients --SendMessage/ReadMessages--> any node (non-leaders redirect to the leader)
+                                            |
+   +----------------------------------------+-----------------------------+
+   | Node shell (nodes/node.py): clock, fault state, peers, gRPC server     |
+   |   mechanisms/consensus.py        Role 2  leader, terms, voting         |
+   |   mechanisms/fault_tolerance.py  Role 3  heartbeats, detection         |
+   |   mechanisms/replication.py      Role 4  log, quorum, catch-up         |
+   |   mechanisms/logical_clock.py    Role 1  Lamport / sync                |
+   +------------------------------------------------------------------------+
+   middleware/rpc.py : applies injected faults + the Lamport merge to EVERY
+   incoming node-to-node RPC in one place, and adds sender + timestamp to
+   outgoing ones. Roles do not re-implement this.
+```
+
+The single shared contract is **`middleware/node.proto`**. If you change it, tell the
+group, then run `python -m tools.gen_proto` and commit the generated
+`middleware/node_pb2*.py` files (generate with the pinned `requirements.txt` versions).
+
+### Interfaces between roles (keep these names stable)
+
+| Provider | Interface | Used by |
+| --- | --- | --- |
+| Role 1 | `node.clock.tick()`, `.update(ts)`, `.time`; `node.now()` (skewable wall clock) | everyone (stamping is automatic in `rpc.py`) |
+| Role 2 | `consensus.is_leader()`, `.leader_id`, `.term`, `.role`, `handle_request_vote`, `handle_append_entries` | Role 4 (writes only on leader), Role 3 (status) |
+| Role 3 | `detector.is_alive(p)`, `.alive_peers()`, `.on_down(cb)`, `.on_up(cb)` | Role 2 (trigger election), Role 4 (skip dead peers) |
+| Role 4 | `replication.client_write()`, `.read()`, `.handle_replicate()`, `.handle_sync()`, `.last_index` | clients, Role 2 (log up-to-date check), Role 3 (rejoin) |
+
+### What is a placeholder vs. done
+
+| Area | State | Owner's job |
+| --- | --- | --- |
+| gRPC contract, config, fault injection, logging, client, Docker | **done** | extend only if needed |
+| Lamport clock | working starter | vector clocks / clock sync, ordering under skew, overhead measurements |
+| Consensus | **placeholder: static leader `node1`** | real election + log agreement, one leader per term, no lost commits |
+| Failure detector | working starter (fixed timeout) | tuning, failover, recovery, measure detection/failover time |
+| Replication | working starter (majority ack, dedup, gap catch-up; **in memory only**) | consistency model + justification, persistence in `DATA_DIR`, commit/rollback of un-acked entries, conflict handling |
+
+### Findings so far (use in the report)
+
+* gRPC's default reconnect backoff grows to minutes, so a restarted node looked dead to
+  its peers. It is capped at 500 ms in `middleware/rpc.py` (affects Role 3's recovery times).
+* A write that misses a majority is reported as `NO_QUORUM` but stays in the leader's
+  log (no rollback yet) - Role 4 / Role 2 must fix this with a commit rule.
+
+### Configuration
+
+All in `middleware/config.py`: cluster size, addresses, timeouts (`RPC_TIMEOUT`,
+`HEARTBEAT_INTERVAL`, `FAILURE_TIMEOUT`). Environment variables:
+
+| Variable | Purpose | Default |
+| --- | --- | --- |
+| `NODE_ID` | Which node this process is (`python -m nodes.node node1` also works) | - |
+| `GRPC_PORT` | Port to listen on | 5005N locally, `50051` in Docker |
+| `DATA_DIR` | Directory where the node may persist state | `data/<node>/` locally, `/data` in Docker |
+| `CLUSTER_SIZE` | Number of nodes | `3` |
+| `CLUSTER_MODE` | `docker` makes nodes address each other as `nodeN:50051` (set in the Dockerfile) | `local` |
+
+To run **5 nodes** (needed to tolerate 2 failures): set `CLUSTER_SIZE=5`
+(`python -m tools.cluster up 5`); for Docker also add `node4`/`node5` services to
+`compose.yaml` (ports `50054`/`50055`) and set `CLUSTER_SIZE: "5"` in the Dockerfile
+`ENV` or each service's `environment`.
 
 ## Prerequisites
 
@@ -23,10 +173,11 @@ Install:
 
 - Git
 - Docker Desktop on Windows or macOS, or Docker Engine with the Compose plugin on Linux
+- Python 3.12+ (only for the client, tools and local mode - not needed inside Docker)
 
 On Windows:
 
-1. Complete Docker Desktop’s WSL 2 setup.
+1. Complete Docker Desktop's WSL 2 setup.
 2. Use Linux containers.
 3. Start Docker Desktop and wait for the engine to run.
 
@@ -40,95 +191,25 @@ docker run --rm hello-world
 
 The final command should display `Hello from Docker!`.
 
-Python does not need to be installed on your computer for this Docker setup. The containers use Python 3.12.
-
-## Setup Files
-
-Run Docker commands from the repository root, which contains:
+## Docker details
 
 | File | Purpose |
 | --- | --- |
-| `Dockerfile` | Builds the shared Python environment |
-| `compose.yaml` | Defines three development nodes |
-| `requirements.txt` | Defines Python dependencies |
+| `Dockerfile` | Builds the shared Python environment; runs `python -m nodes.node` |
+| `compose.yaml` | Defines the three nodes, health checks, named data volumes |
+| `requirements.txt` | Pinned Python dependencies (gRPC 1.76.0) |
 | `.dockerignore` | Excludes unnecessary files from Docker builds |
-| `.gitignore` | Excludes local environments, caches, and runtime data from Git |
-| `tools/__init__.py` | Empty Python package file |
-| `tools/dev_grpc_node.py` | Runs the development gRPC health server |
+| `tools/dev_grpc_node.py` | The original health-only dev server (kept for debugging) |
 
-## Get the Project
-
-After the Docker setup is merged into `dev`, new contributors can run:
-
-```sh
-git clone --branch dev https://github.com/bini-66/Middleware_Group_Assignment.git
-cd Middleware_Group_Assignment
-```
-
-For an existing checkout, commit or stash unfinished work before switching branches:
-
-```sh
-git fetch origin
-git switch dev
-git pull --ff-only origin dev
-```
-
-Before the Docker setup is merged, use its branch instead:
-
-```sh
-git fetch origin
-git switch setup/docker-grpc
-```
-
-## Build and Start
-
-Validate the Compose configuration:
+Validate and start:
 
 ```sh
 docker compose config --quiet
-```
-
-Build the images and start all three nodes:
-
-```sh
 docker compose up --build -d
+docker compose ps          # a temporary "health: starting" status is normal
 ```
 
-The first build may take several minutes.
-
-Check container status:
-
-```sh
-docker compose ps
-```
-
-Expected result: `node1`, `node2`, and `node3` are running and eventually show `healthy`.
-
-A temporary `health: starting` status is normal during startup.
-
-## View Logs
-
-View recent logs:
-
-```sh
-docker compose logs --tail 30
-```
-
-Follow all logs:
-
-```sh
-docker compose logs -f
-```
-
-View one node’s logs:
-
-```sh
-docker compose logs --tail 30 node1
-```
-
-Press `Ctrl+C` to stop following logs. This does not stop the detached containers.
-
-## Node Addresses
+### Node addresses
 
 | Node | From your computer | From another container |
 | --- | --- | --- |
@@ -136,166 +217,55 @@ Press `Ctrl+C` to stop following logs. This does not stop the detached container
 | `node2` | `localhost:50052` | `node2:50051` |
 | `node3` | `localhost:50053` | `node3:50051` |
 
-Each container listens on internal port `50051`. Different host ports allow all three nodes to run on one computer.
+Inside a container, `localhost` is that same container - use service names such as
+`node2:50051` to reach another node. These are gRPC endpoints, not web pages.
 
-Inside a container, `localhost` refers to that same container. Use service names such as `node2:50051` to contact another node.
-
-These are gRPC endpoints, not browser-accessible web pages.
-
-## Test gRPC Communication
-
-Run the following command as one line:
+### Logs
 
 ```sh
-docker compose exec node1 python -c "import grpc; from grpc_health.v1 import health_pb2, health_pb2_grpc; channel = grpc.insecure_channel('node2:50051'); response = health_pb2_grpc.HealthStub(channel).Check(health_pb2.HealthCheckRequest(), timeout=3); assert response.status == health_pb2.HealthCheckResponse.SERVING; print('PASS: node1 reached node2 using gRPC')"
+docker compose logs --tail 30
+docker compose logs -f node1
 ```
 
-Expected output:
+`Ctrl+C` stops following logs; it does not stop the containers.
 
-```text
-PASS: node1 reached node2 using gRPC
-```
-
-To test node 3:
+### Stop, kill and restart nodes
 
 ```sh
-docker compose exec node1 python -c "import grpc; from grpc_health.v1 import health_pb2, health_pb2_grpc; channel = grpc.insecure_channel('node3:50051'); response = health_pb2_grpc.HealthStub(channel).Check(health_pb2.HealthCheckRequest(), timeout=3); assert response.status == health_pb2.HealthCheckResponse.SERVING; print('PASS: node1 reached node3 using gRPC')"
+docker compose stop node2       # graceful
+docker compose kill node2       # abrupt crash
+docker compose start node2      # recover
 ```
 
-These checks verify networking and gRPC health responses. They do not verify consensus or chat-message delivery.
+Automatic restarts are disabled (`restart: "no"`) so nodes deliberately stopped during
+fault demonstrations stay down until you start them.
 
-## Stop and Restart a Node
-
-Gracefully stop node 2:
+### Stop the environment
 
 ```sh
-docker compose stop node2
-docker compose ps -a
+docker compose down             # keeps the data volumes
+docker compose down -v          # ONLY when deliberately deleting all stored cluster data
 ```
 
-Start it again:
+### Persistent storage
 
-```sh
-docker compose start node2
-docker compose ps
-```
+Each node has its own named volume mounted at `/data` (`node1-data`, `node2-data`,
+`node3-data`; Docker may prefix the names with the project name). The node creates its
+directory (`node.data_dir`) but the starter replication keeps the log **in memory** -
+persisting state to `DATA_DIR` is part of Role 3/4. Never share one storage directory
+between nodes.
 
-Wait for it to become healthy, then repeat the gRPC communication check.
+### Developing with Docker
 
-Simulate an abrupt process crash:
+The image contains a copy of the source. After changing Python code, dependencies or
+the Dockerfile, rebuild: `docker compose up --build -d`.
+Open a shell in a node: `docker compose exec node1 sh` (`exit` to leave).
+Make lasting changes in your local repository, not inside a container.
 
-```sh
-docker compose kill node2
-```
+## Contributing changes
 
-Recover the node:
-
-```sh
-docker compose start node2
-```
-
-Automatic restarts are disabled so nodes deliberately stopped during fault demonstrations remain down until explicitly started.
-
-Leader replacement and data recovery require the actual consensus implementation.
-
-## Stop the Environment
-
-Stop and remove containers while preserving their named data volumes:
-
-```sh
-docker compose down
-```
-
-Start again:
-
-```sh
-docker compose up -d
-```
-
-## Persistent Storage
-
-Each node has a separate named volume mounted at `/data`:
-
-- `node1-data`
-- `node2-data`
-- `node3-data`
-
-Docker may prefix these names with the Compose project name.
-
-The development health server creates the data directory but does not store chat messages or consensus state.
-
-The application must explicitly write persistent state to the directory specified by `DATA_DIR`.
-
-**Only when intentionally deleting all stored cluster data**, run:
-
-```sh
-docker compose down -v
-```
-
-Never share one consensus storage directory between nodes.
-
-## Developing with Docker
-
-The Docker image contains a copy of the source code. Local changes are not automatically reflected inside existing containers.
-
-After changing Python code, dependencies, or the Dockerfile, rebuild:
-
-```sh
-docker compose up --build -d
-```
-
-Open a shell inside node 1:
-
-```sh
-docker compose exec node1 sh
-```
-
-Leave the shell:
-
-```sh
-exit
-```
-
-Make lasting code changes in your local repository. Changes made only inside a container can be lost when it is recreated.
-
-## Integrating the Application gRPC Server
-
-The current startup command runs:
-
-```sh
-python -m tools.dev_grpc_node
-```
-
-When the application gRPC server is ready:
-
-1. Define the agreed `.proto` services and generate their Python modules.
-2. Register the application’s gRPC handlers.
-3. Bind the server to `0.0.0.0:50051` inside the container.
-4. Read the environment variables listed below.
-5. Configure peers using Docker Compose service names.
-6. Replace the Dockerfile startup command with the application server’s entry point.
-7. Retain the standard gRPC health service or update the Compose health check.
-8. Generate protobuf modules during the build or include compatible generated modules in the repository.
-
-| Variable | Purpose |
-| --- | --- |
-| `NODE_ID` | Identifies the node |
-| `GRPC_PORT` | Internal listening port |
-| `DATA_DIR` | Persistent storage directory |
-
-The agreed consensus integration point is:
-
-```python
-result = consensus.propose(message)
-```
-
-The development health server does not call this interface or connect to peers automatically.
-
-The existing socket-based client must be updated before it can communicate with the application’s gRPC services.
-
-## Contributing Changes
-
-Create feature branches from an up-to-date `dev` branch. Commit or stash unfinished changes before switching branches.
+Create feature branches from an up-to-date `dev` branch. Commit or stash unfinished
+changes before switching branches.
 
 ```sh
 git fetch origin
@@ -314,26 +284,16 @@ git diff --cached
 git diff --cached --check
 ```
 
-Commit and push:
+Commit and push, then open a pull request targeting `dev` describing the checks you
+actually completed:
 
 ```sh
 git commit -m "Describe your change"
 git push -u origin your-feature-branch
 ```
 
-Open a pull request targeting `dev`. Include a description and the checks actually completed.
-
-For the Docker setup, use `setup/docker-grpc` as the source branch.
-
-After merging the Docker setup, teammates can update and start it:
-
-```sh
-git switch dev
-git pull --ff-only origin dev
-docker compose up --build -d
-```
-
-To bring merged changes into an existing consensus branch:
+Everyone must commit their own role's work regularly - per-member commit history is
+checked in the viva. To bring merged changes into an existing branch:
 
 ```sh
 git switch consensus
@@ -341,22 +301,22 @@ git fetch origin
 git merge origin/dev
 ```
 
-Replace `consensus` with your actual branch name if different.
+(Replace `consensus` with your actual branch name.)
 
 ## Troubleshooting
 
 | Problem | Action |
 | --- | --- |
-| Cannot connect to the Docker daemon | Start Docker Desktop, wait for the engine, and run `docker info`. |
-| `docker compose` is unavailable | Check Docker Desktop or install the Compose plugin on Linux. |
+| Cannot connect to the Docker daemon | Start Docker Desktop, wait for the engine, run `docker info`. |
+| `docker compose` is unavailable | Check Docker Desktop, or install the Compose plugin on Linux. |
 | No configuration file found | Run commands from the folder containing `compose.yaml`. |
-| Port is already allocated | Stop the application using that host port or change the host-side port mapping. |
-| `No module named tools.dev_grpc_node` | Check that both files exist inside `tools`, then rebuild. |
-| Missing gRPC package | Check `requirements.txt`, inspect build errors, and rebuild. |
-| Container is unhealthy or exits | Run `docker compose logs --tail 100 node1` and inspect the error. |
-| gRPC request fails | Check the target is healthy and use its service name and internal port from another container. |
-| Code changes do not appear | Run `docker compose up --build -d`. |
-| Old chat client cannot connect | The development endpoint uses gRPC; use the health check until the gRPC application client is implemented. |
+| Port is already allocated / "cannot bind port" | Another cluster is running. `python -m tools.cluster down` or `docker compose down`. |
+| Code changes do not appear in Docker | `docker compose up --build -d`. |
+| Container unhealthy or exits | `docker compose logs --tail 100 node1`. |
+| Client says nodes unreachable | Check `python -m tools.fault status`; client/tools use `localhost:5005N`. |
+| `ModuleNotFoundError: middleware` | Run commands from the repository root with `python -m ...`. |
+| Protobuf version error on import | Reinstall pinned versions (`pip install -r requirements.txt`) and run `python -m tools.gen_proto`. |
+| Writes fail after killing `node1` | Expected for now: consensus is a static-leader placeholder (Role 2). |
 
 ## Documentation
 
