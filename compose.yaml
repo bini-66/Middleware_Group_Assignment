@@ -1,0 +1,53 @@
+x-node-common: &node-common
+  build: .
+  init: true
+  restart: "no"
+  healthcheck:
+    test:
+      - CMD
+      - python
+      - -c
+      - "import grpc; from grpc_health.v1 import health_pb2, health_pb2_grpc; channel = grpc.insecure_channel('localhost:50051'); response = health_pb2_grpc.HealthStub(channel).Check(health_pb2.HealthCheckRequest(), timeout=2); assert response.status == health_pb2.HealthCheckResponse.SERVING"
+    interval: 5s
+    timeout: 3s
+    retries: 5
+    start_period: 5s
+
+services:
+  node1:
+    <<: *node-common
+    environment:
+      NODE_ID: node1
+      GRPC_PORT: "50051"
+      DATA_DIR: /data
+    ports:
+      - "127.0.0.1:50051:50051"
+    volumes:
+      - node1-data:/data
+
+  node2:
+    <<: *node-common
+    environment:
+      NODE_ID: node2
+      GRPC_PORT: "50051"
+      DATA_DIR: /data
+    ports:
+      - "127.0.0.1:50052:50051"
+    volumes:
+      - node2-data:/data
+
+  node3:
+    <<: *node-common
+    environment:
+      NODE_ID: node3
+      GRPC_PORT: "50051"
+      DATA_DIR: /data
+    ports:
+      - "127.0.0.1:50053:50051"
+    volumes:
+      - node3-data:/data
+
+volumes:
+  node1-data:
+  node2-data:
+  node3-data:
